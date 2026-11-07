@@ -2,10 +2,9 @@
 // Compares against a round-tripped baseline so parser normalisation cancels out.
 import * as Y from 'yjs';
 import { aem2doc, doc2aem } from '@adobe/da-parser';
-import { findRoot, renderedSections, fieldsOf, shortType, KEY_VALUE } from './tree2html.mjs';
+import { findRoot, renderedSections, fieldsOf, shortType, KEY_VALUE, MODELS, component } from './tree2html.mjs';
 
-// model id -> { field: component }, loaded from the site's component-models.json.
-export const MODELS = new Map();
+export { MODELS };
 const VOID = new Set(['img', 'br', 'hr', 'source', 'meta', 'input']);
 export const roundTrip = (body) => { const y = new Y.Doc(); aem2doc(`<body><header></header><main>${body}</main><footer></footer></body>`, y); return doc2aem(y); };
 export const mainOf = (s) => { const a = s.indexOf('<main>'); const b = s.lastIndexOf('</main>'); return a >= 0 ? s.slice(a + 6, b) : s; };
@@ -44,6 +43,8 @@ export function signature(html) {
       if (m[1]) st.pop();
       else {
         st.push(t);
+        // One marker per run of text: a block moving past text changes the shape, Enter does not.
+        if (t !== 'div' && st.length === 2 && sig.at(-1) !== 'd') sig.push('d');
         if (t === 'div' && st.length === 1) sig.push('|');
         else if (t === 'div' && st.length === 2) sig.push(`[${/class="([^"]*)"/.exec(m[3])?.[1] ?? ''}]`);
         else if (t === 'div' && st.length === 3) sig.push('r');
@@ -110,7 +111,7 @@ function fieldOps(n, f, value, assetPrefix) {
   if (img) {
     vals[f] = img[1].replace(assetPrefix, '');
     const alt = value.match(/<img [^>]*alt="([^"]*)"/)?.[1];
-    if (alt !== undefined && (p.modelFields ?? []).some((x) => x.split('@')[0] === `${f}Alt`)) vals[`${f}Alt`] = alt;
+    if (alt !== undefined && (p.modelFields ?? Object.keys(MODELS.get(p.model) ?? {})).some((x) => x.split('@')[0] === `${f}Alt`)) vals[`${f}Alt`] = alt;
   }
   else if (a && p[`${f}Text`] !== undefined) { vals[f] = a[1]; vals[`${f}Text`] = a[2]; }
   else if (a && !/\S/.test(plain(value).replace(/<a [\s\S]*<\/a>/, ''))) vals[f] = a[1];
@@ -166,82 +167,122 @@ function applyOps(doc, ops) {
   const cut = (p) => { const i = p.lastIndexOf('/'); return [at(p.slice(0, i)), Number(p.slice(i + 1))]; };
   ops.forEach((o) => {
     if (o.op === 'remove') { const [a, i] = cut(o.path); a.splice(i, 1); }
+    if (o.op === 'add') { const [a, i] = cut(o.path); a.splice(i, 0, structuredClone(o.value)); }
     if (o.op === 'move') { const [a, i] = cut(o.from); const [v] = a.splice(i, 1); const [b, j] = cut(o.path); b.splice(j, 0, v); }
   });
   return doc;
 }
 
-// Splits a page into sections of whole blocks plus everything else in the section.
+// Splits a page into sections, each an ordered list of its top-level blocks and text elements.
 function layout(html) {
   const secs = []; const re = /<(\/?)([a-z0-9-]+)([^>]*?)(\/?)>/gi; const st = [];
-  let m; let sec; let cursor = 0; let start = -1;
+  let m; let sec; let start = -1;
+  const take = (t) => { if (t.startsWith('<div class="section-metadata')) sec.meta = t; else sec.tokens.push(t); };
   while ((m = re.exec(html))) {
     const t = m[2].toLowerCase();
-    if (!VOID.has(t) && !m[4]) {
-      if (m[1]) {
-        const depth = st.length; st.pop();
-        if (depth === 2 && start >= 0) {
-          const block = html.slice(start, re.lastIndex);
-          if (!block.startsWith('<div class="section-metadata')) {
-            sec.rest += html.slice(cursor, start); sec.blocks.push(block); cursor = re.lastIndex;
-          }
-          start = -1;
-        } else if (depth === 1) sec.rest += html.slice(cursor, m.index);
-      } else {
-        st.push(t);
-        if (st.length === 1) { sec = { rest: '', blocks: [] }; secs.push(sec); cursor = re.lastIndex; }
-        if (st.length === 2 && t === 'div') start = m.index;
-      }
+    if (VOID.has(t) || m[4]) {
+      if (st.length === 1) take(m[0]);
+    } else if (m[1]) {
+      const depth = st.length; st.pop();
+      if (depth === 2) take(html.slice(start, re.lastIndex));
+    } else {
+      st.push(t);
+      if (st.length === 1) { sec = { meta: '', tokens: [] }; secs.push(sec); }
+      if (st.length === 2) start = m.index;
     }
   }
   return secs;
 }
 
-// AEM has no stable page-wide node id, so blocks are matched by their rendered content and
+// Rendered template block -> the node to create. Only exact templates can be added, because
+// nothing else can be turned back into fields reliably.
+const NEW_BLOCKS = new Map();
+export function registerBlock(value) {
+  const html = component(value);
+  const token = layout(mainOf(roundTrip(`<div>${html}</div>`)))[0]?.tokens[0];
+  if (token) NEW_BLOCKS.set(token, value);
+  return html;
+}
+
+// Positions, in order, of the longest run that is already in the right relative order.
+function longestRun(seq) {
+  const best = seq.map(() => 1); const prev = seq.map(() => -1);
+  seq.forEach((v, i) => { for (let j = 0; j < i; j += 1) if (seq[j] < v && best[j] + 1 > best[i]) { best[i] = best[j] + 1; prev[i] = j; } });
+  const keep = new Set(); let i = best.indexOf(Math.max(0, ...best));
+  while (i >= 0) { keep.add(seq[i]); i = prev[i]; }
+  return keep;
+}
+
+// AEM has no stable page-wide node id, so nodes are matched by their rendered content and
 // addressed by position. If-Match on the save is what makes those positions safe to use.
 function structuralOps(content, baseHtml, savedHtml, render) {
   const refuse = (reason) => ({ ops: [], unsupported: [{ key: '*', reason }] });
   const A = layout(baseHtml); const B = layout(savedHtml);
   if (A.length !== B.length) return refuse('sections were added or removed, which is not supported yet');
-  if (A.some((x, i) => x.rest !== B[i].rest)) return refuse('text was changed in the same save as a block move or delete');
+  if (A.some((x, i) => x.meta !== B[i].meta)) return refuse('section settings were changed in the same save as a block move or delete');
   const ptr = pointers(content);
-  const isBlock = (n) => { const t = shortType(n); return n.componentType && !t.startsWith('text/') && !t.startsWith('title/'); };
-  const cur = renderedSections(findRoot(content)).map((x) => ({ ptr: ptr.get(x), items: x.items.map((n) => ({ n })) }));
+  const cur = renderedSections(findRoot(content)).map((x) => ({ ptr: ptr.get(x), items: x.items.map((n) => ({ n, toks: [] })) }));
   if (cur.length !== A.length) return refuse('this page has a section the adapter cannot address');
   for (let i = 0; i < cur.length; i += 1) {
-    const slots = cur[i].items.filter((x) => isBlock(x.n));
-    if (slots.length !== A[i].blocks.length) return refuse('this page has a block the adapter cannot address');
-    slots.forEach((x, j) => { x.fp = A[i].blocks[j]; });
+    let at = 0;
+    cur[i].items.forEach((x) => {
+      const t = shortType(x.n);
+      let count = x.n.componentType ? 1 : 0;
+      if (t.startsWith('text/')) count = fragmentTokens(x.n.properties?.text ?? '');
+      x.toks = A[i].tokens.slice(at, at + count); at += count;
+    });
+    if (at !== A[i].tokens.length) return refuse('this page has content the adapter cannot address');
   }
-  const pool = A.flatMap((x) => x.blocks);
-  for (const fp of B.flatMap((x) => x.blocks)) {
-    const at = pool.indexOf(fp);
-    if (at < 0) return refuse('a block was added or changed, which is not supported yet');
-    pool.splice(at, 1);
+  // Rebuild each section's target order from the saved page.
+  const target = [];
+  for (let si = 0; si < B.length; si += 1) {
+    const list = []; const toks = B[si].tokens; let j = 0;
+    while (j < toks.length) {
+      const fits = (x) => !x.taken && x.toks.length && x.toks.every((t, k) => toks[j + k] === t);
+      const item = cur[si].items.find(fits) ?? cur.flatMap((c) => c.items).find(fits);
+      if (item) {
+        item.taken = true; list.push(item); j += item.toks.length;
+      } else if (NEW_BLOCKS.has(toks[j])) {
+        list.push({ add: NEW_BLOCKS.get(toks[j]) }); j += 1;
+      } else {
+        return refuse(toks[j].startsWith('<div') ? 'a block was changed in the same save as being added or moved' : 'text was changed in the same save as a block move or delete');
+      }
+    }
+    target.push(list);
   }
   const ops = [];
-  const keep = B.flatMap((x) => x.blocks);
-  cur.forEach((c) => {
-    const kept = c.items.map((x) => { if (!x.fp) return true; const i = keep.indexOf(x.fp); if (i < 0) return false; keep.splice(i, 1); return true; });
+  for (const c of cur) {
     for (let i = c.items.length - 1; i >= 0; i -= 1) {
-      if (!kept[i]) { ops.push({ op: 'remove', path: `${c.ptr}/items/${i}` }); c.items.splice(i, 1); }
+      const x = c.items[i];
+      if (x.toks.length && !x.taken) {
+        if (!x.toks[0].startsWith('<div')) return refuse('text was changed in the same save as a block move or delete');
+        ops.push({ op: 'remove', path: `${c.ptr}/items/${i}` }); c.items.splice(i, 1);
+      }
     }
+  }
+  target.forEach((list, si) => {
+    const c = cur[si];
+    const stay = longestRun(list.map((x) => c.items.indexOf(x)).filter((i) => i >= 0));
+    const fixed = new Set([...stay].map((i) => c.items[i]));
+    list.forEach((x, k) => {
+      if (fixed.has(x)) return;
+      if (x.add) {
+        const at = k ? c.items.indexOf(list[k - 1]) + 1 : 0;
+        c.items.splice(at, 0, x);
+        ops.push({ op: 'add', path: `${c.ptr}/items/${at}`, value: x.add });
+        return;
+      }
+      const src = cur.find((o) => o.items.includes(x)); const fi = src.items.indexOf(x);
+      src.items.splice(fi, 1);
+      const ti = k ? c.items.indexOf(list[k - 1]) + 1 : 0;
+      c.items.splice(ti, 0, x);
+      ops.push({ op: 'move', from: `${src.ptr}/items/${fi}`, path: `${c.ptr}/items/${ti}` });
+    });
   });
-  B.forEach((sec, si) => sec.blocks.forEach((fp) => {
-    const open = () => cur[si].items.find((x) => x.fp && !x.placed);
-    const next = open();
-    if (next?.fp === fp) { next.placed = true; return; }
-    const src = [cur[si], ...cur].find((c) => c.items.some((x) => x.fp === fp && !x.placed));
-    const fi = src.items.findIndex((x) => x.fp === fp && !x.placed);
-    const [item] = src.items.splice(fi, 1);
-    const anchor = open(); const ti = anchor ? cur[si].items.indexOf(anchor) : cur[si].items.length;
-    cur[si].items.splice(ti, 0, item); item.placed = true;
-    ops.push({ op: 'move', from: `${src.ptr}/items/${fi}`, path: `${cur[si].ptr}/items/${ti}` });
-  }));
   // An empty section stops rendering, which would shift every later section's position.
   if (cur.some((c) => !c.items.length)) return refuse('the last block in a section cannot be moved or deleted yet');
   // Never send a patch unless applying it reproduces exactly what the editor saved.
-  if (render(applyOps(structuredClone(content), ops)) !== savedHtml) return refuse('this block move cannot be expressed safely, for example past text in the same section');
+  if (render(applyOps(structuredClone(content), ops)) !== savedHtml) return refuse('this block move cannot be expressed safely');
   return { ops, unsupported: [] };
 }
 

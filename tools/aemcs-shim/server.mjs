@@ -4,7 +4,7 @@
 import http from 'node:http';
 import { readFileSync, appendFileSync } from 'node:fs';
 import { tree2html, KEY_VALUE } from './tree2html.mjs';
-import { roundTrip, mainOf, units, signature, ownerMap, buildPatch, MODELS } from './patch.mjs';
+import { roundTrip, mainOf, units, signature, ownerMap, buildPatch, registerBlock, MODELS } from './patch.mjs';
 
 const HOST = process.env.AEMCS_HOST;
 const API = `${HOST}/adobe/experimental/aspm-expires-20251231`;
@@ -18,6 +18,8 @@ const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
   'https://aemcspoc--da-live--adobe.aem.live',
   'https://aemcspoc--da-live--adobe.aem.page',
+  'https://aemcspoc--da-live--keepthebyte.aem.live',
+  'https://aemcspoc--da-live--keepthebyte.aem.page',
   ...(process.env.AEMCS_ORIGINS ?? '').split(',').filter(Boolean),
 ]);
 const LOG = process.env.AEMCS_LOG ?? '/dev/null';
@@ -37,7 +39,24 @@ defs.groups.forEach((g) => g.components.forEach((c) => {
 }));
 
 const models = await (await fetch(`https://main--${REPO}--${ORG}.aem.page/component-models.json`)).json();
-models.forEach((m) => MODELS.set(m.id, Object.fromEntries((m.fields ?? []).map((f) => [f.name, f.component]))));
+models.forEach((m) => MODELS.set(m.id, Object.fromEntries((m.fields ?? []).filter((f) => f.component !== 'tab').map((f) => [f.name, f.component]))));
+
+// EW only offers blocks from a site library, so one is generated from the component definitions.
+// Samples use the page renderer, so an inserted block has exactly the shape AEM will return.
+const filters = await (await fetch(`https://main--${REPO}--${ORG}.aem.page/component-filters.json`)).json();
+const inSection = new Set(filters.find((f) => f.id === 'section')?.components ?? []);
+const LIBRARY = new Map(defs.groups.flatMap((g) => g.components).flatMap((c) => {
+  const page = c.plugins?.xwalk?.page;
+  if (!inSection.has(c.id) || !page?.template?.model || !page.resourceType?.includes('/block/')) return [];
+  const html = registerBlock({ componentType: page.resourceType, properties: page.template });
+  return [[c.id, { title: c.title, html }]];
+}));
+const LIBRARY_CONFIG = {
+  ':type': 'multi-sheet',
+  ':names': ['data', 'library'],
+  data: { data: [] },
+  library: { data: [{ title: 'Blocks', path: `${SELF}/aemcs-library/blocks.json` }] },
+};
 
 const aem = async (path, params) => {
   const url = new URL(`${API}${path}`);
@@ -183,8 +202,18 @@ const server = http.createServer(async (req, res) => {
       const r = await fetch(`${HOST}${pathname.replace('/aemcs-asset', '')}`, { headers: { Authorization: `Bearer ${token()}` } });
       return done(r.status, Buffer.from(await r.arrayBuffer()), { 'Content-Type': r.headers.get('content-type') ?? 'application/octet-stream' }, 'asset');
     }
+    if (pathname === '/aemcs-library/blocks.json') {
+      const data = [...LIBRARY].map(([id, b]) => ({ name: b.title, path: `${SELF}/aemcs-library/${id}.html` }));
+      return done(200, JSON.stringify({ data }), { 'Content-Type': 'application/json' }, 'library');
+    }
+    if (pathname.startsWith('/aemcs-library/')) {
+      const b = LIBRARY.get(pathname.slice('/aemcs-library/'.length).replace(/\.html$/, ''));
+      if (!b) return done(404, '', {}, 'no-block');
+      return done(200, `<body><main><div>${b.html}</div></main></body>`, { 'Content-Type': 'text/html' }, 'library-block');
+    }
     if (!m || m[2] !== ORG || m[3] !== REPO) return done(404, '', {}, 'UNHANDLED');
     const [, kind, , , rest = ''] = m;
+    if (kind === 'config') return done(200, JSON.stringify(LIBRARY_CONFIG), { 'Content-Type': 'application/json' }, 'config');
     if (kind === 'list') {
       const items = await list(rest.replace(/\/$/, ''));
       if (!items) return done(404, '[]', {}, 'no-page');

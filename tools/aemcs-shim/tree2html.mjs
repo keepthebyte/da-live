@@ -7,9 +7,13 @@ const kebab = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace
 const shortType = (n) => (n.componentType ?? '').replace('core/franklin/components/', '');
 const isImagePath = (v) => /\.(png|jpe?g|gif|webp|svg|avif)(\?|$)/i.test(v) || /urn:aaid/.test(v);
 
+// model id -> { field: component }, loaded from the site's component-models.json.
+export const MODELS = new Map();
+
 function fieldsOf(node) {
   const p = node.properties ?? {};
-  const list = (p.modelFields ?? []).map(fieldName);
+  // Nodes created through the API have no modelFields; AEM renders them from the model.
+  const list = (p.modelFields ?? Object.keys(MODELS.get(p.model) ?? {})).map(fieldName);
   const set = new Set(list);
   return list.filter((f) => {
     if (f === 'classes' || f.startsWith('classes_') || f === 'name' || f === 'model') return false;
@@ -80,7 +84,7 @@ export function findRoot(n) {
 }
 
 export const renderedSections = (root) => (root.items ?? []).filter((n) => shortType(n).startsWith('section/') && (n.items ?? []).length);
-export { fieldsOf, shortType };
+export { fieldsOf, shortType, component };
 export function tree2html(content) {
   const root = findRoot(content) ?? content;
   return renderedSections(root).map(section).join('');

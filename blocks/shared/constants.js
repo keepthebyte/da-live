@@ -1,6 +1,8 @@
 export const AEM_ORIGIN = 'https://admin.hlx.page';
 
 // POC: ?aemcs runs EW against the local AEM adapter (tools/aemcs-shim).
+// POC: ?aemcs points the editor at the AEM Cloud Service adapter in tools/aemcs-shim, which has
+// no collab server, so it uses the WebSocket-free save path from offline mode.
 export const AEMCS = new URLSearchParams(window.location.search).has('aemcs');
 export const OFFLINE_MODE = AEMCS;
 

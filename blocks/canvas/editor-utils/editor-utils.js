@@ -586,6 +586,7 @@ export function updateCursors(ctx) {
 // --- preview.js ---
 
 export function getPreviewOrigin(org, repo, branch = 'main') {
+  // POC: AEM pages are delivered by the site's own EDS origin, not the DA preview.
   if (AEMCS) return `https://${normalizeBranch(branch)}--${repo}--${org}.aem.page`;
   const hostname = window?.location?.hostname ?? '';
   const domain = hostname.endsWith('aem.page') || hostname.endsWith('localhost')
@@ -633,6 +634,7 @@ export async function fetchWysiwygCookie({ org, repo, token, branch = 'main' }) 
   if (!org || !repo || !token) {
     throw new Error('fetchWysiwygCookie: org, repo, and token required');
   }
+  // POC: no DA preview session to set up; aem.page serves this site directly.
   if (AEMCS) return;
   const previewUrl = `${getPreviewOrigin(org, repo, branch)}/gimme_cookie`;
   const contentUrl = `${DA_CONTENT}/${org}/${repo}/.gimme_cookie`;

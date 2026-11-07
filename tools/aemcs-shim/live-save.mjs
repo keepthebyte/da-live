@@ -1,5 +1,7 @@
 // Sends the adapter the same multipart save the editor posts, without the editor.
 // Usage: node live-save.mjs <path.html> <cases.mjs>; each case is { name, edit(html) => html }.
+// For testing the write path against real AEM without driving a browser. The adapter must
+// already be running, with the page in AEMCS_WRITE_PAGE. The site path below is hard-coded.
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { roundTrip, mainOf } from './patch.mjs';

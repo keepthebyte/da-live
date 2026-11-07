@@ -1,6 +1,19 @@
-// POC adapter: presents AEM Page Management as the DA admin API on localhost:8787.
-// Read-only. Run: AEMCS_TOKEN_FILE=... node tools/aemcs-shim/server.mjs
+// POC adapter: presents AEM Page Management as the DA admin API on localhost:8787, so EW can
+// edit an AEM page without knowing it isn't talking to DA. See README.md for how to run it.
+//
+//   GET  /list/...          page tree, for the file browser
+//   GET  /source/...html    tree2html() of the page; also opens the session used for saves
+//   POST /source/...html    buildPatch() on the saved HTML, then PATCH to AEM with If-Match
+//   GET  /config/...        points EW at the generated block library
+//   GET  /aemcs-library/*   the generated library
+//   GET  /aemcs-asset/*     proxies author images, which need the token
+//
+// Pages are read-only unless listed in AEMCS_WRITE_PAGE. The IMS token is read from a file and
+// never leaves this process: this is what sidesteps EW's missing API scope and the API's CORS
+// rules, and it is why this design can't ship as is.
+//
 // Every request is logged; the unhandled ones are the measured list of EW's DA dependencies.
+
 import http from 'node:http';
 import { readFileSync, appendFileSync } from 'node:fs';
 import { tree2html, KEY_VALUE } from './tree2html.mjs';
@@ -12,8 +25,11 @@ const SITE_ID = process.env.AEMCS_SITE;
 if (!HOST || !SITE_ID) throw new Error('Set AEMCS_HOST and AEMCS_SITE');
 const ORG = process.env.AEMCS_ORG ?? 'aem-showcase';
 const REPO = process.env.AEMCS_REPO ?? 'frescopa';
+// The AEM page that corresponds to the site root in the file browser.
 const ROOT_PATH = process.env.AEMCS_ROOT ?? '/en';
 const SELF = 'http://localhost:8787';
+// Pages allowed to call this adapter. It holds a real token, so any web page reaching localhost
+// must not be able to save through it.
 const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
   'https://aemcspoc--da-live--adobe.aem.live',
@@ -29,9 +45,13 @@ const DRY_RUN = process.env.AEMCS_DRY_RUN === '1';
 // Real writes are locked to this one page id; every other page stays read-only.
 const WRITE_PAGES = new Set((process.env.AEMCS_WRITE_PAGE ?? '').split(',').filter(Boolean));
 const actionsFor = (id) => (WRITE_PAGES.has(id) ? 'read,write' : 'read');
+// One per opened document, keyed by /source path: the tree, ETag and baseline HTML that the next
+// save is diffed against. In memory only, so after a restart the document must be opened again.
 const sessions = new Map();
+// Read on every call so a fresh token can be dropped in without a restart. IMS tokens last hours.
 const token = () => readFileSync(process.env.AEMCS_TOKEN_FILE, 'utf8').trim();
 
+// The site's own Crosswalk definitions, read from its delivered code at startup.
 const defs = await (await fetch(`https://main--${REPO}--${ORG}.aem.page/component-definition.json`)).json();
 defs.groups.forEach((g) => g.components.forEach((c) => {
   const t = c.plugins?.xwalk?.page?.template;
@@ -51,6 +71,7 @@ const LIBRARY = new Map(defs.groups.flatMap((g) => g.components).flatMap((c) => 
   const html = registerBlock({ componentType: page.resourceType, properties: page.template });
   return [[c.id, { title: c.title, html }]];
 }));
+// Stands in for the site config sheet that points EW at a DA block library.
 const LIBRARY_CONFIG = {
   ':type': 'multi-sheet',
   ':names': ['data', 'library'],
@@ -67,6 +88,8 @@ const aem = async (path, params) => {
   return { status: resp.status, etag: resp.headers.get('etag'), body, ms: Date.now() - started };
 };
 
+// The only write to AEM. If-Match is what makes position-based ops safe: if the page changed
+// since it was read, AEM answers 412 and nothing is applied.
 async function patchContent(session, ops) {
   const url = `${API}/pages/${session.pageId}/content`;
   const resp = await fetch(url, {
@@ -101,8 +124,11 @@ async function pollJob(url, accepted) {
   return { status: 504, body: 'AEM did not finish the save in time' };
 }
 
+// DA calls the home page /index; AEM's publishPath calls it /.
 const toPublish = (p) => (p === '/index' ? '/' : p);
 const fromPage = (page) => (page.publishPath === '/' ? '/index' : page.publishPath);
+// Never invalidated: restart the adapter after creating a page. New pages may also lack a
+// publishPath, in which case they can't be found or listed here.
 const pageCache = new Map();
 async function pageByPath(publishPath) {
   if (pageCache.has(publishPath)) return pageCache.get(publishPath);
@@ -131,6 +157,8 @@ async function children(id) {
 // Delivered image paths need the author session, so route them through this server.
 const rewriteAssets = (html) => html.replace(/(src|href)="(\/content\/dam\/[^"]+)"/g, (m, a, p) => (/\.(png|jpe?g|gif|webp|svg|avif)$/i.test(p) ? `${a}="${SELF}/aemcs-asset${p}"` : m));
 
+// DA's list format: a page is an .html entry, and a page with children also gets a folder entry.
+// Knowing that takes one extra request per page, which is the N+1 noted in the findings.
 async function list(path) {
   const rel = path || '/';
   const parent = await pageByPath(rel === '/' ? ROOT_PATH : rel);
@@ -148,6 +176,8 @@ async function list(path) {
   return out.sort((a, b) => a.name.localeCompare(b.name) || (a.ext ? 1 : -1));
 }
 
+// Routes the subset of the DA admin API that EW uses. Errors go out in x-error, which EW shows
+// in its save status; that is how refusals reach the author.
 const server = http.createServer(async (req, res) => {
   const { pathname } = new URL(req.url, SELF);
   const headers = {
@@ -173,6 +203,7 @@ const server = http.createServer(async (req, res) => {
       const chunks = []; for await (const c of req) chunks.push(c);
       const form = await new Response(Buffer.concat(chunks), { headers: { 'content-type': req.headers['content-type'] } }).formData();
       const html = await form.get('data').text();
+      // A refusal is a 422 so EW keeps the edit in the editor and offers Retry.
       const { ops, unsupported } = buildPatch(session, html);
       const live = WRITE_PAGES.has(session.pageId) && !DRY_RUN;
       const entry = { path: pathname, ifMatch: session.etag, live, ops, unsupported };
@@ -186,6 +217,8 @@ const server = http.createServer(async (req, res) => {
       const r = await patchContent(session, ops);
       appendFileSync(PATCH_LOG, `${JSON.stringify({ ...entry, result: r.status })}\n`);
       if (r.status === 200) {
+        // The saved HTML is the new baseline and AEM's response the new tree, so the next save
+        // is diffed from here without re-reading the page.
         Object.assign(session, { content: r.body, etag: r.etag, baseHtml: mainOf(html), baseUnits: units(mainOf(html)), baseSig: signature(mainOf(html)), own: ownerMap(r.body) });
         return ok(`PATCHED ops=${ops.length}`);
       }

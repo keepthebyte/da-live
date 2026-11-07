@@ -8,9 +8,12 @@ read('AEMCS_DEFS').groups.forEach((g) => g.components.forEach((c) => { const t =
 read('AEMCS_MODELS').forEach((m) => MODELS.set(m.id, Object.fromEntries((m.fields ?? []).filter((f) => f.component !== 'tab').map((f) => [f.name, f.component]))));
 const TEMPLATES = read('AEMCS_DEFS').groups.flatMap((g) => g.components).map((x) => x.plugins?.xwalk?.page).filter((x) => x?.template?.model && x.resourceType?.includes('/block/')).map((x) => ({ componentType: x.resourceType, properties: x.template }));
 TEMPLATES.forEach(registerBlock);
+// Same session shape as server.mjs builds, without the asset proxy.
 const session = (content) => { const base = mainOf(roundTrip(tree2html(content))); return { content, render: (x) => mainOf(roundTrip(tree2html(x))), baseHtml: base, baseUnits: units(base), baseSig: signature(base), own: ownerMap(content), assetPrefix: 'http://x' }; };
+// Counters per scenario. Rows ending in `max ops` record the largest patch seen, not a pass count.
 const tot = {}; const fails = [];
 const hit = (name, ok, note) => { tot[name] ??= { pass: 0, fail: 0 }; tot[name][ok ? 'pass' : 'fail'] += 1; if (!ok) fails.push(`${name}: ${note}`); };
+// Every editable field on a page, with the JSON Pointer the edit is expected to produce.
 const collect = (n, path, acc) => {
   const t = shortType(n); const p = n.properties ?? {};
   if (t.startsWith('text/') && p.text) acc.push({ n, f: 'text', kind: 'text-component', path });

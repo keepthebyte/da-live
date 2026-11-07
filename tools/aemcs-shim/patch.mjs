@@ -1,15 +1,40 @@
-// POC: turn a saved DA document into JSON Patch ops against the AEM content tree.
-// Compares against a round-tripped baseline so parser normalisation cancels out.
+// Write direction: the HTML EW saves -> RFC 6902 JSON Patch ops on the AEM content tree.
+//
+// EW saves a whole document; AEM wants small edits. So buildPatch (bottom of this file) diffs
+// the saved HTML against the HTML this session last served, and picks one of two paths:
+//
+//   Same block shape (signature() unchanged): compare cell by cell, and use ownerMap() to find
+//     the AEM node and field behind each changed cell. Result: replace/add on properties.
+//   Shape changed: structuralOps() works out which nodes moved, went or are new. Result:
+//     move/remove/add on `items`. The result is applied to a copy and rendered, and is only
+//     returned if it reproduces the saved HTML exactly.
+//
+// Two rules hold throughout:
+//   - The baseline is always round-tripped through da-parser, like the saved HTML, so parser
+//     normalisation cancels out and only real edits show up as differences.
+//   - A change that cannot be written is reported in `unsupported`, never dropped. The adapter
+//     turns that into a visible save error instead of a false "Saved".
+//
+// Vocabulary: a "unit" is an addressable piece of a page; a "token" is one top-level element
+// of a section; "default content" is text outside any block.
+//
+// HTML is scanned with a tag regex rather than parsed. That is safe here only because the
+// input always comes from da-parser's output; a real implementation should use the parser.
+
 import * as Y from 'yjs';
 import { aem2doc, doc2aem } from '@adobe/da-parser';
 import { findRoot, renderedSections, fieldsOf, shortType, KEY_VALUE, MODELS, component } from './tree2html.mjs';
 
 export { MODELS };
+// Tags with no closing tag, which the tag scanners below must not push on their stacks.
 const VOID = new Set(['img', 'br', 'hr', 'source', 'meta', 'input']);
+// HTML -> Yjs document -> HTML, the same path a document takes through the editor. Used to get
+// the form EW would save, so that comparisons see edits and not parser normalisation.
 export const roundTrip = (body) => { const y = new Y.Doc(); aem2doc(`<body><header></header><main>${body}</main><footer></footer></body>`, y); return doc2aem(y); };
 export const mainOf = (s) => { const a = s.indexOf('<main>'); const b = s.lastIndexOf('</main>'); return a >= 0 ? s.slice(a + 6, b) : s; };
 
 // Addressable units: block cells (s0b1r2c0) and default-content elements (s0d3).
+// Depth in the tag stack tells us what we're in: 1 section, 2 block or text element, 3 row, 4 cell.
 export function units(html) {
   const out = []; const re = /<(\/?)([a-z0-9-]+)([^>]*?)(\/?)>/gi; const st = [];
   let m; let sec = -1; let blk = -1; let row = -1; let cell = -1; let start = 0; let def = 0; let defStart = -1;
@@ -55,8 +80,14 @@ export function signature(html) {
   return sig.join('');
 }
 
+// How many top-level elements a stored text value becomes. One text component can hold several
+// paragraphs, so one AEM node can own several tokens.
 const fragmentTokens = (h) => units(`<div>${mainOf(roundTrip(`<div>${h}</div>`)).replace(/^<div>/, '').replace(/<\/div>$/, '')}</div>`).filter((u) => /d\d+$/.test(u.k)).length || 1;
 
+// Maps each unit key to the AEM node and field behind it: { n: node, f: field }. Must count in
+// exactly the order tree2html.mjs renders. For text, `keys` lists every unit the node owns,
+// because the node's `text` is written back as a whole. `whole` marks a cell whose full HTML is
+// the value (text inside columns).
 export function ownerMap(content) {
   const root = findRoot(content); const map = new Map();
   renderedSections(root).forEach((sec, si) => {
@@ -88,6 +119,7 @@ export function ownerMap(content) {
   return map;
 }
 
+// Node -> JSON Pointer. AEM has no path-independent address for a node, so ops use positions.
 function pointers(content) {
   const ptr = new Map();
   const walk = (n, p) => { ptr.set(n, p); (n.items ?? []).forEach((c, i) => walk(c, `${p}/items/${i}`)); };
@@ -97,6 +129,7 @@ function pointers(content) {
 
 const plain = (v) => v.replace(/^\s*<p>([\s\S]*)<\/p>\s*$/, '$1').trim();
 const hasMarkup = (v) => /<(strong|em|u|s|sub|sup|code|br)\b/.test(v);
+// richtext, text and so on. Decides whether a cell's markup is stored or reduced to plain text.
 function kindOf(n, f) {
   const p = n.properties ?? {};
   const typed = (p.modelFields ?? []).find((x) => x.split('@')[0] === f)?.split('@')[1];
@@ -104,6 +137,9 @@ function kindOf(n, f) {
   return typed ?? MODELS.get(p.model)?.[f] ?? (/^\s*<[a-z]/i.test(p[f] ?? '') ? 'richtext' : 'text');
 }
 
+// Works out which properties one edited block cell maps to. One cell can feed several: an image
+// cell sets the path and its alt, a link cell sets the URL and its text, a heading its level.
+// Returns { vals: property -> value, issues: reasons the edit cannot be stored }.
 function fieldOps(n, f, value, assetPrefix) {
   const p = n.properties ?? {}; const issues = []; const vals = {};
   const a = value.match(/<a [^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/);
@@ -126,10 +162,14 @@ function fieldOps(n, f, value, assetPrefix) {
   return { vals, issues };
 }
 
+// Default-content unit keys of one section, in document order.
 const defaultKeys = (map, sec) => [...map.keys()].filter((k) => k.startsWith(`s${sec}d`)).sort((x, y) => Number(x.split('d')[1]) - Number(y.split('d')[1]));
 
 // Aligns one section's default content by common prefix and suffix, so a new or
 // removed paragraph does not read as an edit to everything after it.
+// a and b map unit keys to HTML, before and after. The prefix and suffix that match are left
+// alone; whatever is between them has to land in one text node, or (when the element count is
+// unchanged) in each node that owns part of it. `add` queues a property write.
 function defaultEdits(sec, a, b, own, add, unsupported) {
   const bk = defaultKeys(a, sec); const B = bk.map((k) => a.get(k)); const A = defaultKeys(b, sec).map((k) => b.get(k));
   let p = 0; while (p < B.length && p < A.length && B[p] === A[p]) p += 1;
@@ -162,6 +202,8 @@ function defaultEdits(sec, a, b, own, add, unsupported) {
   write(o, [...B.slice(i0, Math.min(p, i1 + 1)), ...A.slice(p, A.length - e), ...B.slice(Math.max(B.length - e, i0), i1 + 1)]);
 }
 
+// Minimal JSON Patch, covering only the op shapes this file generates. Used to check a patch
+// before sending it, and it fails the same way for a bad path: by throwing.
 function applyOps(doc, ops) {
   const at = (p) => p.split('/').slice(1).reduce((n, k) => n[k], doc);
   const cut = (p) => { const i = p.lastIndexOf('/'); return [at(p.slice(0, i)), Number(p.slice(i + 1))]; };
@@ -208,6 +250,8 @@ export function registerBlock(value) {
 }
 
 // Positions, in order, of the longest run that is already in the right relative order.
+// Nodes in this run stay put and all others move, which gives the fewest possible move ops
+// (longest increasing subsequence).
 function longestRun(seq) {
   const best = seq.map(() => 1); const prev = seq.map(() => -1);
   seq.forEach((v, i) => { for (let j = 0; j < i; j += 1) if (seq[j] < v && best[j] + 1 > best[i]) { best[i] = best[j] + 1; prev[i] = j; } });
@@ -218,6 +262,13 @@ function longestRun(seq) {
 
 // AEM has no stable page-wide node id, so nodes are matched by their rendered content and
 // addressed by position. If-Match on the save is what makes those positions safe to use.
+//
+// Steps: (1) give every node the tokens it rendered, (2) rebuild each section's target order
+// from the saved page, marking nodes as matched, new or gone, (3) emit text replaces, then
+// removes, then moves and adds, keeping `cur` in step with what AEM's positions will be after
+// each op, (4) apply the ops to a copy and refuse unless the page renders as saved.
+// A refusal returns no ops at all: AEM showed that a failed multi-op PATCH applies nothing, and
+// a partly correct patch here would be worse than an error.
 function structuralOps(content, baseHtml, savedHtml, render) {
   const refuse = (reason) => ({ ops: [], unsupported: [{ key: '*', reason }] });
   const A = layout(baseHtml); const B = layout(savedHtml);
@@ -310,6 +361,8 @@ function structuralOps(content, baseHtml, savedHtml, render) {
 }
 
 // Returns { ops, unsupported }. The ops are never sent by this module.
+// session fields: content (AEM tree), baseHtml/baseUnits/baseSig (what was served), own
+// (ownerMap), assetPrefix (the proxy prefix to strip from image paths), render (tree -> HTML).
 export function buildPatch({ content, baseHtml, baseUnits, baseSig, own, assetPrefix, render }, savedHtml) {
   if (signature(mainOf(savedHtml)) !== baseSig) return structuralOps(content, baseHtml, mainOf(savedHtml), render);
   const after = units(mainOf(savedHtml)); const ptr = pointers(content);

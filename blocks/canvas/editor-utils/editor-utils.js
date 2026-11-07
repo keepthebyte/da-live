@@ -1,4 +1,5 @@
 import { TextSelection } from 'da-y-wrapper';
+import { AEMCS } from '../../shared/constants.js';
 import prose2aem from '../../shared/prose2aem.js';
 import { wrapTablesInWrappers } from '../../shared/version/compare.js';
 import { getNx, getNx2 } from '../../../scripts/utils.js';
@@ -585,6 +586,7 @@ export function updateCursors(ctx) {
 // --- preview.js ---
 
 export function getPreviewOrigin(org, repo, branch = 'main') {
+  if (AEMCS) return `https://${normalizeBranch(branch)}--${repo}--${org}.aem.page`;
   const hostname = window?.location?.hostname ?? '';
   const domain = hostname.endsWith('aem.page') || hostname.endsWith('localhost')
     ? 'stage-preview.da.live'
@@ -631,6 +633,7 @@ export async function fetchWysiwygCookie({ org, repo, token, branch = 'main' }) 
   if (!org || !repo || !token) {
     throw new Error('fetchWysiwygCookie: org, repo, and token required');
   }
+  if (AEMCS) return;
   const previewUrl = `${getPreviewOrigin(org, repo, branch)}/gimme_cookie`;
   const contentUrl = `${DA_CONTENT}/${org}/${repo}/.gimme_cookie`;
 

@@ -1,6 +1,8 @@
 export const AEM_ORIGIN = 'https://admin.hlx.page';
 
-export const OFFLINE_MODE = false;
+// POC: ?aemcs runs EW against the local AEM adapter (tools/aemcs-shim).
+export const AEMCS = new URLSearchParams(window.location.search).has('aemcs');
+export const OFFLINE_MODE = AEMCS;
 
 export const SUPPORTED_IMAGE_TYPES = [
   'image/svg+xml', 'image/png', 'image/jpeg', 'image/gif', 'image/avif', 'image/webp',

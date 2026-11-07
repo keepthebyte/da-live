@@ -168,6 +168,7 @@ function applyOps(doc, ops) {
   ops.forEach((o) => {
     if (o.op === 'remove') { const [a, i] = cut(o.path); a.splice(i, 1); }
     if (o.op === 'add') { const [a, i] = cut(o.path); a.splice(i, 0, structuredClone(o.value)); }
+    if (o.op === 'replace') { const i = o.path.lastIndexOf('/'); at(o.path.slice(0, i))[o.path.slice(i + 1)] = o.value; }
     if (o.op === 'move') { const [a, i] = cut(o.from); const [v] = a.splice(i, 1); const [b, j] = cut(o.path); b.splice(j, 0, v); }
   });
   return doc;
@@ -193,6 +194,8 @@ function layout(html) {
   }
   return secs;
 }
+
+const TEXT_COMPONENT = 'core/franklin/components/text/v1/text';
 
 // Rendered template block -> the node to create. Only exact templates can be added, because
 // nothing else can be turned back into fields reliably.
@@ -239,23 +242,43 @@ function structuralOps(content, baseHtml, savedHtml, render) {
     const list = []; const toks = B[si].tokens; let j = 0;
     while (j < toks.length) {
       const fits = (x) => !x.taken && x.toks.length && x.toks.every((t, k) => toks[j + k] === t);
-      const item = cur[si].items.find(fits) ?? cur.flatMap((c) => c.items).find(fits);
+      const match = () => cur[si].items.find(fits) ?? cur.flatMap((c) => c.items).find(fits);
+      const item = match();
       if (item) {
         item.taken = true; list.push(item); j += item.toks.length;
       } else if (NEW_BLOCKS.has(toks[j])) {
         list.push({ add: NEW_BLOCKS.get(toks[j]) }); j += 1;
+      } else if (toks[j].startsWith('<div')) {
+        return refuse('a block was changed in the same save as being added or moved');
       } else {
-        return refuse(toks[j].startsWith('<div') ? 'a block was changed in the same save as being added or moved' : 'text was changed in the same save as a block move or delete');
+        // New text with no text component at this spot: one new component for the whole run.
+        const run = [];
+        while (j < toks.length && !toks[j].startsWith('<div') && !match()) { run.push(toks[j]); j += 1; }
+        list.push({ add: { componentType: TEXT_COMPONENT, properties: { text: run.join('') } } });
       }
     }
     target.push(list);
   }
   const ops = [];
+  // A changed text node shows up as text gone from the section plus new text in it. Pair them
+  // in order and treat each pair as an edit, which keeps the node. Paths use the starting
+  // positions, so these go before any removal or move.
+  target.forEach((list, si) => {
+    const gone = cur[si].items.filter((x) => x.toks.length && !x.taken && shortType(x.n).startsWith('text/'));
+    list.forEach((x, k) => {
+      if (x.add?.componentType !== TEXT_COMPONENT) return;
+      const node = gone.shift();
+      if (!node) { cur[si].newText = true; return; }
+      node.taken = true; list[k] = node;
+      ops.push({ op: 'replace', path: `${ptr.get(node.n)}/properties/text`, value: x.add.properties.text });
+    });
+  });
   for (const c of cur) {
     for (let i = c.items.length - 1; i >= 0; i -= 1) {
       const x = c.items[i];
       if (x.toks.length && !x.taken) {
-        if (!x.toks[0].startsWith('<div')) return refuse('text was changed in the same save as a block move or delete');
+        // Removed and new text in one section is an edit; delete-and-add would lose the node.
+        if (!x.toks[0].startsWith('<div') && c.newText) return refuse('text was changed in the same save as a block move or delete');
         ops.push({ op: 'remove', path: `${c.ptr}/items/${i}` }); c.items.splice(i, 1);
       }
     }

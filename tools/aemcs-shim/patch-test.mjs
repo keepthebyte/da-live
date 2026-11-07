@@ -77,7 +77,7 @@ const check = (name, pg, c, mutate) => {
   const saved = roundTrip(tree2html(next)); const r = buildPatch(s, saved);
   const got = roundTrip(tree2html(apply(clone(c), r.ops)));
   // Refusing is safe; a patch that produces a different page is the failure.
-  if (r.unsupported.length && !r.ops.length) { hit(`${name} (refused)`, true); return; }
+  if (r.unsupported.length && !r.ops.length) { hit(`${name} (refused)`, true); if (process.env.AEMCS_WHY) console.log(`refused ${name} on ${pg}: ${r.unsupported[0].reason}`); return; }
   hit(name, mainOf(got) === mainOf(saved), `${pg} ops=${r.ops.length} ${JSON.stringify(r.ops).slice(0, 170)} ${(() => { const g = mainOf(got); const w = mainOf(saved); let i = 0; while (i < g.length && g[i] === w[i]) i += 1; return `at ${i}/${w.length} got=[${g.slice(Math.max(0, i - 40), i + 70)}] want=[${w.slice(Math.max(0, i - 40), i + 70)}]`; })()}`);
   tot[`${name} max ops`] = { pass: Math.max(tot[`${name} max ops`]?.pass ?? 0, r.ops.length), fail: 0 };
 };
@@ -99,12 +99,25 @@ for (const pg of read('AEMCS_FIXTURES').pages) {
   }
   const walk = (n) => { const p = n.properties; if (p?.modelFields && p.model && MODELS.has(p.model) && /^block\//.test(shortType(n))) { const a = fieldsOf(n).join(); const b = fieldsOf({ properties: { ...p, modelFields: undefined } }).join(); hit('fields from model', a === b, `${pg.page.name} ${p.model} stored=[${a}] model=[${b}]`); } (n.items ?? []).forEach(walk); };
   walk(findRoot(c));
+  // A slash command: a text component loses its last paragraph and a block takes its place.
+  const slash = TEMPLATES[0];
+  renderedSections(findRoot(c)).forEach((sec, i) => sec.items.forEach((n, k) => {
+    if (!/^text\//.test(shortType(n)) || (n.properties.text.match(/<\/p>/g) ?? []).length < 2) return;
+    check('text shrinks + block added', pg.page.name, c, (S) => { const v = S[i].items[k]; v.properties.text = v.properties.text.replace(/<p>(?:(?!<p>)[\s\S])*<\/p>\s*$/, ''); S[i].items.splice(k + 1, 0, clone(slash)); return true; });
+  }));
+  const newText = () => ({ componentType: 'core/franklin/components/text/v1/text', properties: { text: '<p>New paragraph</p>' } });
+  renderedSections(findRoot(c)).forEach((sec, i) => {
+    const hasBlockFirst = isB(sec.items[0] ?? {});
+    if (hasBlockFirst) check('add text before block', pg.page.name, c, (S) => { S[i].items.unshift(newText()); return true; });
+    if (hasBlockFirst) check('add text after block', pg.page.name, c, (S) => { S[i].items.splice(1, 0, newText()); return true; });
+    sec.items.forEach((n, k) => { if (/^(text|title)\//.test(shortType(n)) && sec.items.length > 1) check('delete text node', pg.page.name, c, (S) => { S[i].items.splice(k, 1); return true; }); });
+  });
   TEMPLATES.forEach((t, ti) => { if (ti % 3 === 0) check('add block', pg.page.name, c, (S) => { S[0].items.push(clone(t)); return true; }); });
   const s = session(c); const m = clone(c); const S = renderedSections(findRoot(m)); const lone = S.find((x) => x.items.length === 1 && isB(x.items[0]));
   if (lone) { lone.items.length = 0; lone.items.push(); const h = tree2html(c).replace(/<div class="(?!section-metadata)[^"]*">[\s\S]*?<\/div><\/div><\/div>/, ''); const r = buildPatch(s, roundTrip(h)); hit('refuses without ops', r.ops.length === 0 && r.unsupported.length > 0, `${pg.page.name} ops=${r.ops.length}`); }
   const e = clone(c); const T = collect(findRoot(e), '', []).find((x) => x.kind === 'text-component' || x.kind === 'title');
   const B0 = renderedSections(findRoot(e)).find((x) => x.items.filter(isB).length && x.items.length > 1);
-  if (T && B0) { T.n.properties[T.f] = T.f === 'title' ? `${T.n.properties[T.f]}ZZ` : T.n.properties[T.f].replace(/<\/(p|h[1-6])>/, 'ZZ</$1>'); B0.items.splice(B0.items.findIndex(isB), 1); const r = buildPatch(s, roundTrip(tree2html(e))); hit('refuses edit + delete', r.ops.length === 0 && r.unsupported.length > 0, `${pg.page.name} ops=${r.ops.length}`); }
+  if (T && B0) { T.n.properties[T.f] = T.f === 'title' ? `${T.n.properties[T.f]}ZZ` : T.n.properties[T.f].replace(/<\/(p|h[1-6])>/, 'ZZ</$1>'); B0.items.splice(B0.items.findIndex(isB), 1); const saved = roundTrip(tree2html(e)); const r = buildPatch(s, saved); const same = mainOf(roundTrip(tree2html(apply(clone(c), r.ops)))) === mainOf(saved); hit(r.ops.length ? 'edit + delete exact' : 'edit + delete refused', r.ops.length ? same : r.unsupported.length > 0, `${pg.page.name} ops=${r.ops.length}`); }
 }
 Object.entries(tot).forEach(([k, v]) => console.log(k.padEnd(22), `pass ${v.pass}`, v.fail ? `FAIL ${v.fail}` : ''));
 console.log(fails.slice(0, 14).join('\n'));
